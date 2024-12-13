@@ -14,6 +14,8 @@ from packaging.utils import canonicalize_name
 
 from cartography.intel.github.util import fetch_all
 from cartography.intel.github.util import PaginatedGraphqlData
+from cartography.util import backoff_handler
+from cartography.util import retries_with_backoff
 from cartography.util import run_cleanup_job
 from cartography.util import timeit
 
@@ -134,13 +136,35 @@ GITHUB_REPO_COLLABS_PAGINATED_GRAPHQL = """
     """
 
 
+def _get_repo_collaborators_inner_func(
+        org: str,
+        api_url: str,
+        token: str,
+        repo_name: str,
+        affiliation: str,
+        collab_users: list[dict[str, Any]],
+        collab_permission: list[str],
+) -> None:
+    logger.info(f"Loading {affiliation} collaborators for repo {repo_name}.")
+    collaborators = _get_repo_collaborators(token, api_url, org, repo_name, affiliation)
+
+    # nodes and edges are expected to always be present given that we only call for them if totalCount is > 0
+    # however sometimes GitHub returns None, as in issue 1334 and 1404.
+    for collab in collaborators.nodes or []:
+        collab_users.append(collab)
+
+    # The `or []` is because `.edges` can be None.
+    for perm in collaborators.edges or []:
+        collab_permission.append(perm['permission'])
+
+
 def _get_repo_collaborators_for_multiple_repos(
         repo_raw_data: list[dict[str, Any]],
         affiliation: str,
         org: str,
         api_url: str,
         token: str,
-) -> dict[str, List[UserAffiliationAndRepoPermission]]:
+) -> dict[str, list[UserAffiliationAndRepoPermission]]:
     """
     For every repo in the given list, retrieve the collaborators.
     :param repo_raw_data: A list of dicts representing repos. See tests.data.github.repos.GET_REPOS for data shape.
@@ -151,7 +175,7 @@ def _get_repo_collaborators_for_multiple_repos(
     :param token: The Github API token as string.
     :return: A dictionary of repo URL to list of UserAffiliationAndRepoPermission
     """
-    result: dict[str, List[UserAffiliationAndRepoPermission]] = {}
+    result: dict[str, list[UserAffiliationAndRepoPermission]] = {}
     for repo in repo_raw_data:
         repo_name = repo['name']
         repo_url = repo['url']
@@ -162,14 +186,23 @@ def _get_repo_collaborators_for_multiple_repos(
             result[repo_url] = []
             continue
 
-        collab_users = []
-        collab_permission = []
-        collaborators = _get_repo_collaborators(token, api_url, org, repo_name, affiliation)
-        # nodes and edges are expected to always be present given that we only call for them if totalCount is > 0
-        for collab in collaborators.nodes:
-            collab_users.append(collab)
-        for perm in collaborators.edges:
-            collab_permission.append(perm['permission'])
+        collab_users: List[dict[str, Any]] = []
+        collab_permission: List[str] = []
+
+        retries_with_backoff(
+            _get_repo_collaborators_inner_func,
+            TypeError,
+            5,
+            backoff_handler,
+        )(
+            org=org,
+            api_url=api_url,
+            token=token,
+            repo_name=repo_name,
+            affiliation=affiliation,
+            collab_users=collab_users,
+            collab_permission=collab_permission,
+        )
 
         result[repo_url] = [
             UserAffiliationAndRepoPermission(user, permission, affiliation)
